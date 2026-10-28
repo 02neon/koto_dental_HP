@@ -1,38 +1,45 @@
 # koto_dental_HP
 ホームページあるなし仕分け
 
-江東区の歯科医院を Google Places API で一覧化し、ホームページの状況で分類して CSV に出力します。
+江東区の歯科医院を一覧化し、歯科医師会の会員／非会員を付けたうえで、ホームページの状況で分類して CSV に出力します。
 
 ## 使い方
 
 ```bash
 pip install -r requirements.txt
-export PLACES_API_KEY=xxxx   # Places API (New) を有効にしたキー
-python koto_dental.py --places-cache places.json -o koto_dental_clinics.csv
+python koto_dental.py -o koto_dental_clinics.csv            # APIキー不要
+PLACES_API_KEY=xxxx python koto_dental.py --places-cache places.json   # Google 検索も加える
 ```
 
-- `--places-cache` : 検索結果を保存し、2回目以降は API を呼ばずに再利用（課金節約）
-- `--towns 豊洲,亀戸` : 町名を絞って試す
-- `--input-csv list.csv` : Places を使わず、`医院名,公式URL` 列の CSV を解析
-- `--members-only` : Places を使わず、江東区歯科医師会の会員だけを解析（APIキー不要。非会員は識別できない）
-- `--no-members` : 歯科医師会名簿との突合をしない
+| オプション | 内容 |
+|---|---|
+| `--places-cache p.json` | Places 検索結果を保存し、次回は API を呼ばずに再利用 |
+| `--towns 豊洲,亀戸` | Places で検索する町名を絞る |
+| `--input-csv list.csv` | Places の代わりに手元の CSV（医院名,公式URL,住所,電話）を使う |
+| `--cache-dir .cache` | 厚生局PDF・医療情報ネットZIPの保存先（同じファイルは再ダウンロードしない） |
+| `--no-kouseikyoku` / `--no-navi` / `--no-members` | 各データ源を使わない |
+| `--web-urls path.csv` | Web検索結果のCSV（既定: `data/web_search_urls.csv`） |
 
-## 歯科医師会 会員／非会員
+## データ源と統合
 
-[江東区歯科医師会の会員診療所案内](https://kotoku-shikaishikai.com/clinics/)（地区別13ページ）から医院名・住所・電話・HPリンクを取り込み、Places の結果と突き合わせます。
+| データ源 | 役割 |
+|---|---|
+| [関東信越厚生局 コード内容別医療機関一覧表（東京都・歯科）](https://kouseikyoku.mhlw.go.jp/kantoshinetsu/chousa/shitei.html) | 保険診療をしている全歯科診療所。医療機関番号の上2桁 `08` が江東区。一覧の母集団 |
+| Google Places API（任意） | 医院名・住所・電話・公式URL |
+| [江東区歯科医師会 会員診療所案内](https://kotoku-shikaishikai.com/clinics/) | 会員判定、HPリンク |
+| [医療情報ネット オープンデータ（歯科診療所・施設票）](https://www.mhlw.go.jp/stf/seisakunitsuite/bunya/kenkou_iryou/iryou/newpage_43373.html) | HPアドレスの補完 |
+| `data/web_search_urls.csv` | 上記のどこにもURLが無かった医院を手作業でWeb検索した結果（URL空欄＝ポータル掲載のみ等で公式サイト無し）。電話番号で突合 |
 
 - 突合の順：①電話番号一致 → ②住所（町名+丁目+番）一致かつ医院名が部分一致 → ③医院名一致かつ同じ町丁目
-- 一致 → `会員`、一致なし → `非会員`。Places に出てこない会員も「名簿のみ」として行を追加
-- 公式URLは Google の登録を優先し、無い（または SNS・ポータル）場合は名簿のリンクを使う（`URL出典` 列）
+- 歯科医師会名簿に一致した医院が `会員`、それ以外が `非会員`
+- どこにも一致しない行は、その出典だけの行として追加（`出典` 列で確認可）。厚生局一覧に無い行は `突合` 列に「移転/閉院/病院歯科の可能性」と注記
+- 公式URLは Google → 歯科医師会名簿 → 医療情報ネット → Web検索 の順に、SNS・ポータルでないものを採用（`URL出典` 列）
 
-## 処理内容
+## HP の解析
 
-1. 「江東区<町名> 歯科」を江東区の全町名（46）で Text Search（各最大60件）。place_id で重複排除し、住所が江東区・歯科のものだけ残す
-2. 公式URLの HTML を取得し抽出
-   - 予約システム：リンク先ドメインで判定（EPARK / Apotool / デンタルアポ / ジコノート / Airリザーブ / LINE予約 など）。トップに無ければ自院内の「ネット予約」ページも1〜2枚たどる
-   - 制作会社：「Powered by／Supported by／制作：」の直後のリンク文字・ロゴ画像のalt・ドメイン、またはテキスト表記（CMS名は除外）
-   - コピーライト年・viewport・https・CMS
-3. 区分を判定し根拠と一緒に出力
+- 予約システム：リンク先ドメインで判定（EPARK / Apotool / デンタルアポ / ジコノート / Airリザーブ / LINE予約 など）。トップに無ければ自院内の「ネット予約」ページも1〜2枚たどる
+- 制作会社：「Powered by／Supported by／制作：」の直後のリンク文字・ロゴ画像のalt・ドメイン、またはテキスト表記（CMS名は除外）
+- コピーライト年・viewport・https・CMS
 
 | 区分 | 条件 |
 |---|---|

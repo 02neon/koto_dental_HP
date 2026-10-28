@@ -2,17 +2,17 @@
 """江東区の歯科医院を一覧化し、ホームページの状況で分類して CSV に出力する。
 
 手順
-  1. Google Places API (New) の Text Search で「江東区<町名> 歯科」を町名ごとに検索し、
-     医院名・住所・電話・公式URLを place_id で重複排除して集める。
-  2. 各公式URLの HTML を取得し、予約システム・制作会社・コピーライト年・
-     viewport の有無・https の有無を抽出する。
-  3. 「HPなし / 昔風・簡易 / 今風 / 予約システムあり」に自動判定し、根拠と一緒に CSV へ出力する。
+  1. 一覧づくり(下の順に突き合わせて1院1行に統合)
+     - 関東信越厚生局「コード内容別医療機関一覧表(東京都・歯科)」PDF … 保険診療の全歯科診療所(母集団)
+     - Google Places API(PLACES_API_KEY があれば)… 「江東区<町名> 歯科」を町名ごとに検索
+     - 江東区歯科医師会「会員診療所案内」… 一致すれば会員、しなければ非会員
+     - 医療情報ネット(厚労省)オープンデータ … HP アドレスの補完
+  2. 各公式URLの HTML を取得し、予約システム・制作会社・コピーライト年・viewport・https を抽出
+  3. 「HPなし / HPあり(解析不可) / 昔風・簡易 / 今風 / 予約システムあり」を判定し、根拠付きで CSV へ
 
 使い方
-  export PLACES_API_KEY=xxxx
-  python koto_dental.py                       # 検索 → 解析 → CSV
-  python koto_dental.py --places-cache p.json # 検索結果を保存し、次回は API を呼ばずに再利用
-  python koto_dental.py --input-csv list.csv  # Places を使わず、手元の CSV (医院名,公式URL,...) を解析
+  python koto_dental.py                         # APIキーなしでも動く(Google 検索だけ省略)
+  PLACES_API_KEY=xxxx python koto_dental.py --places-cache places.json
 """
 from __future__ import annotations
 
@@ -292,7 +292,7 @@ def clean_producer(name: str) -> str:
     if len(name) < 2 or re.fullmatch(r"[\d\s.]+", name) or NOT_PRODUCER.match(name):
         return ""
     # 「Powered by WordPress」のような CMS 名は制作会社ではない
-    if re.match(CMS_NAMES, name, re.I):
+    if re.match(CMS_NAMES, name, re.I) or re.search(r"wordpress|wix|jimdo|goope|peraichi", name, re.I):
         return ""
     return name[:60]
 
@@ -419,9 +419,109 @@ def analyze(url: str, session: requests.Session) -> dict:
     return res
 
 
-# ---------------------------------------------------------------- 1b. 江東区歯科医師会の会員名簿
+# ---------------------------------------------------------------- 1b. 公的な一覧・歯科医師会名簿
 
 KDA_INDEX = "https://kotoku-shikaishikai.com/clinics/"
+KOUSEIKYOKU_PAGE = "https://kouseikyoku.mhlw.go.jp/kantoshinetsu/chousa/shitei.html"
+NAVI_PAGE = "https://www.mhlw.go.jp/stf/seisakunitsuite/bunya/kenkou_iryou/iryou/newpage_43373.html"
+KOTO_KOUSEIKYOKU_CODE = "08"   # 関東信越厚生局の医療機関番号で江東区を表す上2桁
+KOTO_CITY_CODE = "108"         # 全国地方公共団体コード 13108 の市区町村部分
+
+
+def download(url: str, session: requests.Session, cache_dir: str) -> str:
+    """URL をキャッシュディレクトリに保存してパスを返す(同名ファイルがあれば再利用)。"""
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, os.path.basename(urlparse(url).path))
+    if not os.path.exists(path):
+        r = session.get(url, timeout=120)
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            f.write(r.content)
+    return path
+
+
+def find_link(session: requests.Session, page: str, pattern: str) -> str:
+    r = session.get(page, timeout=30)
+    r.raise_for_status()
+    for a in decode_html(r).find_all("a", href=True):
+        if re.search(pattern, a["href"]):
+            return urljoin(page, a["href"])
+    sys.exit(f"{page} に {pattern} のリンクが見つかりません(ページ構成が変わった可能性)")
+
+
+def fetch_kouseikyoku(session: requests.Session, cache_dir: str) -> list[dict]:
+    """関東信越厚生局「コード内容別医療機関一覧表(東京都・歯科)」PDF から江東区分を取り出す。
+
+    保険診療をしている歯科診療所はすべて載るため、区内の歯科医院の母集団として使う。
+    """
+    import pdfplumber
+    import pypdf
+
+    url = find_link(session, KOUSEIKYOKU_PAGE, r"shitei_shika_tokyo.*\.pdf$")
+    path = download(url, session, cache_dir)
+    code_re = re.compile(rf"(?<!\d){KOTO_KOUSEIKYOKU_CODE},\d{{4}},\d")
+    # 1) 江東区のレコードがあるページを高速に特定
+    reader = pypdf.PdfReader(path)
+    pages = [i for i, pg in enumerate(reader.pages) if code_re.search(pg.extract_text() or "")]
+    if not pages:
+        sys.exit("厚生局PDFに江東区の医療機関が見つかりません")
+    # 2) 座標で列を切り分けて1件ずつ組み立てる
+    #    列の x 位置: 項番+医療機関番号 <145 / 名称 145-250 / 所在地 250-370 / 電話 370-455
+    recs, cur = [], None
+    with pdfplumber.open(path) as pdf:
+        for pi in range(max(0, pages[0] - 1), min(len(pdf.pages), pages[-1] + 2)):
+            lines: dict[int, list] = {}
+            for w in pdf.pages[pi].extract_words():
+                if w["top"] > 122:  # 見出し行より下
+                    lines.setdefault(round(w["top"]), []).append(w)
+            for top in sorted(lines):
+                row = sorted(lines[top], key=lambda w: w["x0"])
+                m = re.fullmatch(r"(\d+?)(\d\d),(\d{4}),(\d)", row[0]["text"]) if row[0]["x0"] < 145 else None
+                if m:
+                    cur = {"code": m.group(2), "no": f"{m.group(2)},{m.group(3)},{m.group(4)}",
+                           "name": [], "addr": [], "phone": []}
+                    recs.append(cur)
+                    row = row[1:]
+                if cur is None:
+                    continue
+                for w in row:
+                    x = w["x0"]
+                    col = "name" if 145 <= x < 250 else "addr" if 250 <= x < 370 else \
+                          "phone" if 370 <= x < 455 else None
+                    if col:
+                        cur[col].append(w["text"])
+    out = []
+    for r in recs:
+        if r["code"] != KOTO_KOUSEIKYOKU_CODE:
+            continue
+        ph = re.search(r"\d{2,4}-\d{2,4}-\d{3,4}", " ".join(r["phone"]))
+        addr = re.sub(r"^〒\d{3}[－-]\d{4}", "", "".join(r["addr"]))
+        out.append({"医院名": unicodedata.normalize("NFKC", "".join(r["name"])),
+                    "住所": unicodedata.normalize("NFKC", addr),
+                    "電話": ph.group(0) if ph else "", "医療機関番号": r["no"]})
+    print(f"厚生局 保険医療機関一覧: 江東区 {len(out)} 院 ({os.path.basename(path)})", file=sys.stderr)
+    return out
+
+
+def fetch_navi(session: requests.Session, cache_dir: str) -> list[dict]:
+    """医療情報ネット(ナビイ)オープンデータの歯科診療所・施設票から江東区分と HP アドレスを取る。"""
+    import io
+    import zipfile
+
+    url = find_link(session, NAVI_PAGE, r"03-1_dental_facility_info.*\.zip$")
+    path = download(url, session, cache_dir)
+    with zipfile.ZipFile(path) as z:
+        name = next(n for n in z.namelist() if n.endswith(".csv"))
+        text = z.read(name).decode("utf-8-sig")
+    out = []
+    for row in csv.DictReader(io.StringIO(text)):
+        if row.get("都道府県コード") == "13" and row.get("市区町村コード") == KOTO_CITY_CODE \
+                and "保健所" not in row["正式名称"]:
+            out.append({"医院名": row["正式名称"], "住所": unicodedata.normalize("NFKC", row["所在地"]),
+                        "電話": "", "ナビURL": (row.get("案内用ホームページアドレス") or "").strip(),
+                        "ナビID": row["ID"]})
+    print(f"医療情報ネット: 江東区 {len(out)} 院 ({os.path.basename(path)})", file=sys.stderr)
+    return out
 
 
 def fetch_members(session: requests.Session) -> list[dict]:
@@ -454,81 +554,142 @@ def fetch_members(session: requests.Session) -> list[dict]:
     return members
 
 
+# ---------------------------------------------------------------- 1c. 突合
+
+KANJI_NUM = {c: i for i, c in enumerate("〇一二三四五六七八九")}
+
+
+def kanji_to_int(k: str) -> int:
+    if "十" in k:
+        a, _, b = k.partition("十")
+        return (KANJI_NUM.get(a, 1) if a else 1) * 10 + (KANJI_NUM.get(b, 0) if b else 0)
+    return int("".join(str(KANJI_NUM[c]) for c in k))
+
+
 def norm_phone(p: str) -> str:
     d = re.sub(r"\D", "", unicodedata.normalize("NFKC", p or ""))
     return d[-10:] if len(d) >= 10 else d
 
 
+ITAIJI = str.maketrans("髙﨑栁邉邊齋齊濵濱嶋德惠廣澤櫻ッ", "高崎柳辺辺斎斉浜浜島徳恵広沢桜ツ")
+PUA = re.compile("[-]")  # PDF の外字(𠮷・邊など)は私用領域の文字として出てくる
+
+
 def name_core(n: str) -> str:
-    n = unicodedata.normalize("NFKC", n or "").lower()
-    n = re.sub(r"(医療法人|社会医療法人)(社団|財団)?\S*?会", "", n)
-    n = re.sub(r"[\s・･\-ー‐()（）「」]", "", n)
+    n = unicodedata.normalize("NFKC", n or "").lower().translate(ITAIJI).replace("𠮷", "吉")
+    n = re.sub(r"(医療法人|社会医療法人|\(医\)|医\))(社団|財団)?\S*?会", "", n)
+    n = re.sub(r"^(医療法人|社会医療法人)(社団|財団)?", "", n)
+    n = re.sub(r"[\s・･\-ー‐()（）「」.、]", "", n)
     return re.sub(r"(歯科医院|歯科クリニック|デンタルクリニック|デンタルオフィス|歯科診療所|"
                   r"矯正歯科|小児歯科|歯科|歯医者|クリニック|医院|診療所|dentalclinic|dental)", "", n)
 
 
-def addr_key(a: str) -> str:
-    """「森下2-14-5」→「森下2-14」(町名+丁目+番)。"""
+def names_match(a: str, b: str, exact: bool = False) -> bool:
+    """医院名の中核部分が一致(exact=False なら一方が他方を含む)。外字は任意の1文字として扱う。"""
+    ca, cb = name_core(a), name_core(b)
+    if not ca or not cb:
+        return False
+    if PUA.search(ca) or PUA.search(cb):
+        pa, pb = (".".join(re.escape(x) for x in PUA.split(c)) for c in (ca, cb))
+        if exact:
+            return bool(re.fullmatch(pa, cb) or re.fullmatch(pb, ca))
+        return bool(re.search(pa, cb) or re.search(pb, ca))
+    return ca == cb if exact else (ca in cb or cb in ca)
+
+
+def addr_parts(a: str) -> tuple[str, str, str, str]:
+    """住所を (町名, 丁目, 番, 号) に分ける。「森下二丁目14番5号」「森下2-14-5」どちらも可。"""
     a = unicodedata.normalize("NFKC", a or "")
+    a = re.sub(r"([〇一二三四五六七八九十]+)丁目", lambda m: f"{kanji_to_int(m.group(1))}丁目", a)
     a = re.sub(r"[−‐―ーｰ–—]", "-", a)
     a = re.sub(r"(\d+)丁目", r"\1-", a).replace("番地", "-").replace("番", "-")
-    m = re.search(r"江東区\s*([^\d\s]+?)(\d+)-(\d+)", a)
-    return f"{m.group(1)}{m.group(2)}-{m.group(3)}" if m else ""
+    m = re.search(r"江東区\s*([^\d\s]+?)\s*(\d+)\s*-\s*(\d+)(?:\s*-\s*(\d+))?", a)
+    return (m.group(1), m.group(2), m.group(3), m.group(4) or "") if m else ("", "", "", "")
 
 
-def match_member(c: dict, members: list[dict]) -> tuple[dict | None, str]:
+def addr_key(a: str) -> str:
+    """「江東区森下二丁目14番5号」「森下2-14-5」→「森下2-14」(町名+丁目+番)。"""
+    t, c, b, _ = addr_parts(a)
+    return f"{t}{c}-{b}" if t else ""
+
+
+def find_match(c: dict, pool: list[dict]) -> tuple[dict | None, str]:
     ph = norm_phone(c.get("電話", ""))
-    if ph:
-        for m in members:
-            if norm_phone(m["電話"]) == ph:
+    if len(ph) >= 9:
+        for m in pool:
+            if norm_phone(m.get("電話", "")) == ph:
                 return m, "電話一致"
-    ak, nc = addr_key(c.get("住所", "")), name_core(c.get("医院名", ""))
-    for m in members:
-        mc = name_core(m["医院名"])
-        if ak and ak == addr_key(m["住所"]) and nc and mc and (nc in mc or mc in nc):
+    ak, name = addr_key(c.get("住所", "")), c.get("医院名", "")
+    for m in pool:
+        if ak and ak == addr_key(m["住所"]) and names_match(name, m["医院名"]):
             return m, "住所+医院名一致"
-    for m in members:
-        if nc and len(nc) >= 2 and nc == name_core(m["医院名"]) and \
-                ak.split("-")[0] == addr_key(m["住所"]).split("-")[0]:
+    town = ak.split("-")[0]
+    for m in pool:
+        if town and town == addr_key(m["住所"]).split("-")[0] and names_match(name, m["医院名"], exact=True):
             return m, "医院名+町丁目一致"
+    for m in pool:
+        if len(name_core(name)) >= 4 and names_match(name, m["医院名"], exact=True):
+            return m, "医院名一致(住所表記違い)"
+    full = addr_parts(c.get("住所", ""))
+    for m in pool:
+        both_phone = len(ph) >= 9 and len(norm_phone(m.get("電話", ""))) >= 9
+        if full[3] and full == addr_parts(m["住所"]) and not both_phone:
+            return m, "住所一致のみ(名称違い・要確認)"
     return None, ""
 
 
-def merge_members(clinics: list[dict], members: list[dict]) -> list[dict]:
-    """Places の結果に会員/非会員を付け、Places に出てこない会員も行として足す。"""
-    used = set()
-    for c in clinics:
-        m, how = match_member(c, [x for i, x in enumerate(members) if i not in used])
-        if m:
-            used.add(members.index(m))
-            c.update({"歯科医師会": "会員", "突合根拠": how, "地区": m["地区"],
-                      "名簿の医院名": m["医院名"], "名簿URL": m["名簿URL"]})
-        else:
-            c.update({"歯科医師会": "非会員", "突合根拠": "会員名簿に該当なし"})
-    for i, m in enumerate(members):
-        if i in used:
+def dedupe(rows: list[dict]) -> list[dict]:
+    """同じ医院が名簿に2回載っている場合などを1件にまとめる(電話+医院名で判定)。"""
+    seen, out = set(), []
+    for r in rows:
+        k = (norm_phone(r.get("電話", "")), name_core(r.get("医院名", "")))
+        if k in seen:
             continue
-        clinics.append({"医院名": m["医院名"], "住所": m["住所"], "電話": m["電話"],
-                        "公式URL": "", "名簿URL": m["名簿URL"], "地区": m["地区"],
-                        "名簿の医院名": m["医院名"], "歯科医師会": "会員",
-                        "突合根拠": "名簿のみ(Google検索で未検出)",
-                        "検索町名": "", "place_id": ""})
-    return clinics
+        seen.add(k)
+        out.append(r)
+    return out
+
+
+def absorb(clinics: list[dict], others: list[dict], label: str, fields: list[str],
+           on_match=None, add_unmatched: bool = True) -> None:
+    """others の各行を clinics に突き合わせ、一致すれば fields を写し、無ければ新しい行として足す。"""
+    taken: set[int] = set()
+    for o in others:
+        pool = [c for c in clinics if id(c) not in taken]
+        m, how = find_match(o, pool)
+        if m:
+            taken.add(id(m))
+            for f in fields:
+                if o.get(f) and not m.get(f):
+                    m[f] = o[f]
+            if PUA.search(m["医院名"]) and not PUA.search(o["医院名"]):
+                m["医院名"] = o["医院名"]  # 厚生局PDFの外字化けを読める名前に
+            m["出典"].append(label)
+            m.setdefault("突合", []).append(f"{label}:{how}")
+            if on_match:
+                on_match(m, o)
+        elif add_unmatched:
+            row = {k: o.get(k, "") for k in ("医院名", "住所", "電話", *fields)}
+            row["出典"] = [label]
+            if clinics and clinics[0]["出典"][0] == "厚生局":
+                row["突合"] = [f"{label}のみ(厚生局の保険医療機関一覧に無し・移転/閉院/病院歯科の可能性)"]
+            if on_match:
+                on_match(row, o)
+            clinics.append(row)
+            taken.add(id(row))
+
+
+def mark_member(c: dict, m: dict) -> None:
+    c.update({"歯科医師会": "会員", "地区": m["地区"], "名簿の医院名": m["医院名"]})
 
 
 def pick_official_url(c: dict) -> None:
-    """Google の URL を優先し、無い/SNS なら名簿のリンクを使う。"""
-    g, m = c.get("公式URL", ""), c.get("名簿URL", "")
-    if g and not is_non_official(g):
-        c["URL出典"] = "Google"
-    elif m and not is_non_official(m):
-        c["公式URL"], c["URL出典"] = m, "歯科医師会名簿"
-    elif g:
-        c["URL出典"] = "Google"
-    elif m:
-        c["公式URL"], c["URL出典"] = m, "歯科医師会名簿"
-    else:
-        c["URL出典"] = ""
+    """Google → 歯科医師会名簿 → 医療情報ネット の順に、SNS/ポータルでない URL を採用する。"""
+    cands = [("Google", c.get("GoogleURL", "")), ("歯科医師会名簿", c.get("名簿URL", "")),
+             ("医療情報ネット", c.get("ナビURL", "")), ("Web検索", c.get("WebURL", ""))]
+    cands = [(s, u) for s, u in cands if u]
+    best = next(((s, u) for s, u in cands if not is_non_official(u)), cands[0] if cands else ("", ""))
+    c["URL出典"], c["公式URL"] = best
 
 
 # ---------------------------------------------------------------- 3. 分類
@@ -536,8 +697,10 @@ def pick_official_url(c: dict) -> None:
 def classify(c: dict) -> tuple[str, str]:
     url = c.get("公式URL", "")
     if not url:
-        src = "Google・歯科医師会名簿とも" if c.get("歯科医師会") == "会員" else "Google"
-        return "HPなし", f"公式URLの登録なし({src})"
+        why = f"公式URLの登録なし({'・'.join(x for x in c.get('出典', []) if x != 'Web検索') or '-'} のいずれにも無し)"
+        if c.get("Webメモ"):
+            why += f" / Web検索: {c['Webメモ']}"
+        return "HPなし", why
     if is_non_official(url):
         return "HPなし", f"登録URLがSNS/ポータル({host_of(url)})"
     err = c.get("取得エラー")
@@ -575,32 +738,72 @@ def classify(c: dict) -> tuple[str, str]:
 
 # ---------------------------------------------------------------- main
 
-COLUMNS = ["区分", "判定根拠", "歯科医師会", "突合根拠", "地区", "医院名", "名簿の医院名",
-           "住所", "電話", "公式URL", "URL出典", "最終URL",
-           "予約システム", "予約リンク", "制作会社", "コピーライト年", "viewport",
-           "https", "CMS", "フレーム", "本文文字数", "HTTPステータス", "取得エラー",
-           "検索町名", "place_id"]
+COLUMNS = ["区分", "判定根拠", "歯科医師会", "地区", "医院名", "名簿の医院名", "住所", "電話",
+           "公式URL", "URL出典", "最終URL", "予約システム", "予約リンク", "制作会社", "コピーライト年",
+           "viewport", "https", "CMS", "フレーム", "本文文字数", "HTTPステータス", "取得エラー",
+           "出典", "突合", "医療機関番号", "ナビID", "place_id"]
+
+
+def load_web_urls(path: str) -> list[dict]:
+    """手作業の Web 検索で見つけた公式URL(URL 空欄=見つからなかった)を読み込む。"""
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        r.update({"住所": "", "WebURL": r.get("URL", "").strip(), "Webメモ": r.get("メモ", "").strip()})
+    print(f"Web検索結果: {len(rows)} 件 ({path})", file=sys.stderr)
+    return rows
 
 
 def load_input_csv(path: str) -> list[dict]:
     with open(path, encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
     for r in rows:
-        for k in ("医院名", "住所", "電話", "公式URL", "検索町名", "place_id"):
+        r["GoogleURL"] = r.pop("公式URL", "")
+        for k in ("医院名", "住所", "電話"):
             r.setdefault(k, "")
     return rows
+
+
+def load_places(args) -> list[dict] | None:
+    if args.input_csv:
+        return load_input_csv(args.input_csv)
+    if args.places_cache and os.path.exists(args.places_cache):
+        with open(args.places_cache, encoding="utf-8") as f:
+            clinics = json.load(f)
+        print(f"Places: キャッシュから {len(clinics)} 件", file=sys.stderr)
+    else:
+        key = os.environ.get("PLACES_API_KEY")
+        if not key:
+            print("Places: PLACES_API_KEY が無いため Google 検索はスキップ", file=sys.stderr)
+            return None
+        towns = args.towns.split(",") if args.towns else KOTO_TOWNS
+        print(f"Places API で {len(towns)} 町を検索中...", file=sys.stderr)
+        clinics = search_places(key, towns)
+        if args.places_cache:
+            with open(args.places_cache, "w", encoding="utf-8") as f:
+                json.dump(clinics, f, ensure_ascii=False, indent=1)
+    for c in clinics:
+        if "公式URL" in c:
+            c["GoogleURL"] = c.pop("公式URL")
+    return clinics
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-o", "--output", default="koto_dental_clinics.csv")
     ap.add_argument("--places-cache", help="Places 検索結果の JSON。存在すれば再利用し、無ければ保存する")
-    ap.add_argument("--input-csv", help="Places を使わず、この CSV(医院名,公式URL 列)を解析する")
-    ap.add_argument("--towns", help="検索する町名をカンマ区切りで指定(既定: 江東区の全町名)")
-    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--input-csv", help="Places の代わりに、この CSV(医院名,公式URL,住所,電話 列)を使う")
+    ap.add_argument("--towns", help="Places で検索する町名をカンマ区切りで指定(既定: 江東区の全町名)")
+    ap.add_argument("--cache-dir", default=".cache", help="厚生局PDF・医療情報ネットZIPの保存先")
+    ap.add_argument("--no-kouseikyoku", action="store_true", help="厚生局の保険医療機関一覧を使わない")
+    ap.add_argument("--no-navi", action="store_true", help="医療情報ネットのオープンデータを使わない")
     ap.add_argument("--no-members", action="store_true", help="歯科医師会名簿との突合をしない")
-    ap.add_argument("--members-only", action="store_true",
-                    help="Places を使わず歯科医師会の会員だけを解析する(非会員は識別できない)")
+    ap.add_argument("--web-urls", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                       "data", "web_search_urls.csv"),
+                    help="Web検索で調べた公式URLの CSV(医院名,電話,URL,メモ)")
+    ap.add_argument("--workers", type=int, default=8)
     args = ap.parse_args()
 
     session = requests.Session()
@@ -609,33 +812,28 @@ def main():
     session.mount("http://", adapter)
     session.mount("https://", adapter)
 
-    # 1. 一覧取得
-    if args.members_only:
-        clinics = []
-    elif args.input_csv:
-        clinics = load_input_csv(args.input_csv)
-    elif args.places_cache and os.path.exists(args.places_cache):
-        with open(args.places_cache, encoding="utf-8") as f:
-            clinics = json.load(f)
-        print(f"キャッシュから {len(clinics)} 件読み込み", file=sys.stderr)
-    else:
-        key = os.environ.get("PLACES_API_KEY")
-        if not key:
-            sys.exit("環境変数 PLACES_API_KEY が設定されていません")
-        towns = args.towns.split(",") if args.towns else KOTO_TOWNS
-        print(f"Places API で {len(towns)} 町を検索中...", file=sys.stderr)
-        clinics = search_places(key, towns)
-        if args.places_cache:
-            with open(args.places_cache, "w", encoding="utf-8") as f:
-                json.dump(clinics, f, ensure_ascii=False, indent=1)
+    # 1. 一覧づくり: 厚生局(母集団) ← Google ← 歯科医師会名簿 ← 医療情報ネット の順に突き合わせて統合
+    clinics: list[dict] = []
+    if not args.no_kouseikyoku:
+        for c in fetch_kouseikyoku(session, args.cache_dir):
+            c["出典"] = ["厚生局"]
+            clinics.append(c)
+    places = load_places(args)
+    if places:
+        absorb(clinics, places, "Google", ["GoogleURL", "place_id", "検索町名"])
     if not args.no_members:
-        clinics = merge_members(clinics, fetch_members(session))
+        absorb(clinics, dedupe(fetch_members(session)), "歯科医師会", ["名簿URL"], on_match=mark_member)
+    if not args.no_navi:
+        absorb(clinics, fetch_navi(session, args.cache_dir), "医療情報ネット", ["ナビURL", "ナビID"])
+    web = load_web_urls(args.web_urls)
+    if web:
+        absorb(clinics, web, "Web検索", ["WebURL", "Webメモ"], add_unmatched=False)
     for c in clinics:
+        c.setdefault("歯科医師会", "非会員" if not args.no_members else "")
         pick_official_url(c)
     print(f"対象: {len(clinics)} 院", file=sys.stderr)
 
     # 2. HP 解析(同じURLは1回だけ取得)
-
     urls = sorted({c["公式URL"] for c in clinics if c.get("公式URL") and not is_non_official(c["公式URL"])})
     print(f"HP取得: {len(urls)} URL", file=sys.stderr)
     with ThreadPoolExecutor(args.workers) as ex:
@@ -646,6 +844,8 @@ def main():
     for c in clinics:
         c.update(results.get(c.get("公式URL", ""), analyze("", session)))
         c["区分"], c["判定根拠"] = classify(c)
+        c["出典"] = "・".join(c.get("出典", []))
+        c["突合"] = " / ".join(c.get("突合", []))
         rows.append(c)
     order = {"HPなし": 0, "HPあり(解析不可)": 1, "昔風・簡易": 2, "今風": 3, "予約システムあり": 4}
     rows.sort(key=lambda r: (r.get("歯科医師会", ""), order[r["区分"]], r.get("住所", "")))
