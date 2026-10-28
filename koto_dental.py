@@ -24,11 +24,15 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+import warnings
+
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 # ---------------------------------------------------------------- 設定
 
@@ -75,15 +79,16 @@ NON_OFFICIAL_HOSTS = [
     "epark.jp", "haisha-yoyaku.jp", "caloo.jp", "shika-town.com", "doctorsfile.jp",
     "byoinnavi.jp", "hotpepper.jp", "ekiten.jp", "qlife.jp", "fdoc.jp",
     "medicaldoc.jp", "minkou.jp", "haisha-guide.jp", "dentalclinic.jp",
+    "localplace.jp", "jda.or.jp", "maps.app.goo.gl",
 ]
 
 PRODUCER_PATTERNS = [
-    r"(?:ホームページ|HP|ＨＰ|サイト|Web|WEB)?\s*制作\s*(?:会社)?\s*[:：/／|｜]?\s*([^\n|｜©]{2,40})",
-    r"(?:Produced|Designed|Created|Developed|Powered|Made|Site|Website|Web\s*design)\s+by\s*[:：]?\s*([^\n|｜©]{2,40})",
+    r"(?:ホームページ|HP|ＨＰ|サイト|Web|WEB)?\s*制作\s*(?:会社)?\s*[:：/／|｜]\s*([^\n|｜©]{2,40})",
+    r"(?:Produced|Designed|Created|Developed|Powered|Supported|Made|Site|Website|Web\s*design)\s+by\s*[:：]?\s*([^\n|｜©]{2,40})",
     r"(?:Design|Produce)\s*[:：]\s*([^\n|｜©]{2,40})",
 ]
 
-CMS_NAMES = r"(WordPress|Wix|Jimdo|STUDIO|ペライチ|Goope|グーペ|BiND|Shopify|Movable\s*Type|a-blog|Squarespace|WebSite\s*X5)"
+CMS_NAMES = r"(WordPress|Webnode|Wix|Jimdo|STUDIO|ペライチ|Goope|グーペ|BiND|Shopify|Movable\s*Type|a-blog|Squarespace|WebSite\s*X5)"
 
 COPYRIGHT_RE = re.compile(
     r"(?:©|&copy;|\(c\)|（c）|copyright|コピーライト)[^0-9\n]{0,60}"
@@ -179,6 +184,9 @@ def fetch(url: str, session: requests.Session) -> tuple[requests.Response | None
     for attempt in range(2):
         try:
             r = session.get(url, timeout=20, allow_redirects=True)
+            if r.status_code in (429, 503) and attempt == 0:
+                time.sleep(5)  # アクセス集中の一時拒否は少し待って取り直す
+                continue
             return r, ""
         except requests.exceptions.SSLError:
             # 証明書不備のサイトは http で取り直す(https 判定は「なし」になる)
@@ -271,23 +279,47 @@ def footer_text(soup: BeautifulSoup) -> str:
     return "\n".join(parts)
 
 
-def detect_producer(soup: BeautifulSoup, ftext: str) -> str:
+PRODUCER_LEAD = re.compile(
+    r"(produced|designed|created|developed|powered|supported|made|site|website|web\s*design)\s+by"
+    r"|^\s*(ホームページ|HP|ＨＰ|サイト|web)?制作(会社)?\s*[:：/／|｜]?\s*$"
+    r"|制作(会社)?\s*[:：]\s*$", re.I)
+NOT_PRODUCER = re.compile(r"^(トップページ|top|page\s*top|home|ホーム|サイトマップ|プライバシー.*|個人情報.*)$", re.I)
+
+
+def clean_producer(name: str) -> str:
+    name = re.sub(r"\s+", " ", name or "").strip(" 　:：-–|｜/")
+    name = re.split(r"\s{2,}|All rights|Copyright|©", name, flags=re.I)[0].strip()
+    if len(name) < 2 or re.fullmatch(r"[\d\s.]+", name) or NOT_PRODUCER.match(name):
+        return ""
+    # 「Powered by WordPress」のような CMS 名は制作会社ではない
+    if re.match(CMS_NAMES, name, re.I):
+        return ""
+    return name[:60]
+
+
+def detect_producer(soups: list[BeautifulSoup], ftext: str) -> str:
+    # 1) 「Powered by」「制作:」の直後にあるリンク(文字・ロゴ画像の alt・ドメイン)
+    for soup in soups:
+        for node in soup.find_all(string=PRODUCER_LEAD):
+            a = node.parent if node.parent.name == "a" else node.find_next("a")
+            if a is None:
+                continue
+            # 遠く離れたリンクを拾わないよう、間の文字数が少ないときだけ採用
+            between = node.parent.get_text(" ", strip=True) if node.parent.name != "a" else ""
+            if len(between) > 120:
+                continue
+            img = a.find("img")
+            for cand in (a.get_text(" ", strip=True), img.get("alt") if img else "",
+                         a.get("title", ""), host_of(a.get("href", "")).removeprefix("www.")):
+                name = clean_producer(cand)
+                if name and not PRODUCER_LEAD.fullmatch(name):
+                    return name
+    # 2) テキストのみの表記(「制作：○○」「Designed by ○○」)
     for pat in PRODUCER_PATTERNS:
         for m in re.finditer(pat, ftext, re.I):
-            name = m.group(1).strip(" 　:：-–|｜/")
-            name = re.split(r"\s{2,}|All rights|Copyright|©", name, flags=re.I)[0].strip()
-            if len(name) < 2 or re.fullmatch(r"[\d\s.]+", name):
-                continue
-            # 「Powered by WordPress」のような CMS 名は制作会社ではない
-            if re.match(CMS_NAMES, name, re.I):
-                continue
-            return name
-    # フッター内の「制作」系リンクのテキスト / title
-    for f in soup.find_all(["footer"]) or []:
-        for a in f.find_all("a"):
-            t = " ".join(filter(None, [a.get_text(" ", strip=True), a.get("title", "")]))
-            if re.search(r"制作|produced|designed|created", t, re.I):
-                return t[:60]
+            name = clean_producer(m.group(1))
+            if name:
+                return name
     return ""
 
 
@@ -376,7 +408,7 @@ def analyze(url: str, session: requests.Session) -> dict:
     res.update({
         "予約システム": " / ".join(systems),
         "予約リンク": " ".join(evidence),
-        "制作会社": detect_producer(soup, ftext),
+        "制作会社": detect_producer([x for x, _ in soups], ftext),
         "CMS": detect_cms(soup, html),
         "コピーライト年": year or "",
         "viewport": "あり" if any(s.find("meta", attrs={"name": re.compile("^viewport$", re.I)})
@@ -387,16 +419,133 @@ def analyze(url: str, session: requests.Session) -> dict:
     return res
 
 
+# ---------------------------------------------------------------- 1b. 江東区歯科医師会の会員名簿
+
+KDA_INDEX = "https://kotoku-shikaishikai.com/clinics/"
+
+
+def fetch_members(session: requests.Session) -> list[dict]:
+    """江東区歯科医師会「会員診療所案内」の地区別ページから会員一覧を取る。"""
+    r = session.get(KDA_INDEX, timeout=30)
+    r.raise_for_status()
+    idx = decode_html(r)
+    districts = [(a["href"], a.get_text(" ", strip=True).split(" ")[0])
+                 for a in idx.select("a.vk_button_link") if a.get("href")]
+    if not districts:
+        sys.exit("歯科医師会ページの地区リンクが見つかりません(ページ構成が変わった可能性)")
+    members = []
+    for url, district in districts:
+        rr = session.get(url, timeout=30)
+        rr.raise_for_status()
+        for tr in decode_html(rr).select("table tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 3 or tds[0].get_text(strip=True) == "歯科医院名":
+                continue
+            a = tds[0].find("a", href=True)
+            members.append({
+                "医院名": tds[0].get_text(" ", strip=True),
+                "住所": tds[1].get_text(" ", strip=True),
+                "電話": tds[2].get_text(" ", strip=True).replace("tel:", "").strip(),
+                "名簿URL": a["href"].strip() if a else "",
+                "地区": district,
+            })
+        time.sleep(0.3)
+    print(f"歯科医師会 会員: {len(members)} 院({len(districts)} 地区)", file=sys.stderr)
+    return members
+
+
+def norm_phone(p: str) -> str:
+    d = re.sub(r"\D", "", unicodedata.normalize("NFKC", p or ""))
+    return d[-10:] if len(d) >= 10 else d
+
+
+def name_core(n: str) -> str:
+    n = unicodedata.normalize("NFKC", n or "").lower()
+    n = re.sub(r"(医療法人|社会医療法人)(社団|財団)?\S*?会", "", n)
+    n = re.sub(r"[\s・･\-ー‐()（）「」]", "", n)
+    return re.sub(r"(歯科医院|歯科クリニック|デンタルクリニック|デンタルオフィス|歯科診療所|"
+                  r"矯正歯科|小児歯科|歯科|歯医者|クリニック|医院|診療所|dentalclinic|dental)", "", n)
+
+
+def addr_key(a: str) -> str:
+    """「森下2-14-5」→「森下2-14」(町名+丁目+番)。"""
+    a = unicodedata.normalize("NFKC", a or "")
+    a = re.sub(r"[−‐―ーｰ–—]", "-", a)
+    a = re.sub(r"(\d+)丁目", r"\1-", a).replace("番地", "-").replace("番", "-")
+    m = re.search(r"江東区\s*([^\d\s]+?)(\d+)-(\d+)", a)
+    return f"{m.group(1)}{m.group(2)}-{m.group(3)}" if m else ""
+
+
+def match_member(c: dict, members: list[dict]) -> tuple[dict | None, str]:
+    ph = norm_phone(c.get("電話", ""))
+    if ph:
+        for m in members:
+            if norm_phone(m["電話"]) == ph:
+                return m, "電話一致"
+    ak, nc = addr_key(c.get("住所", "")), name_core(c.get("医院名", ""))
+    for m in members:
+        mc = name_core(m["医院名"])
+        if ak and ak == addr_key(m["住所"]) and nc and mc and (nc in mc or mc in nc):
+            return m, "住所+医院名一致"
+    for m in members:
+        if nc and len(nc) >= 2 and nc == name_core(m["医院名"]) and \
+                ak.split("-")[0] == addr_key(m["住所"]).split("-")[0]:
+            return m, "医院名+町丁目一致"
+    return None, ""
+
+
+def merge_members(clinics: list[dict], members: list[dict]) -> list[dict]:
+    """Places の結果に会員/非会員を付け、Places に出てこない会員も行として足す。"""
+    used = set()
+    for c in clinics:
+        m, how = match_member(c, [x for i, x in enumerate(members) if i not in used])
+        if m:
+            used.add(members.index(m))
+            c.update({"歯科医師会": "会員", "突合根拠": how, "地区": m["地区"],
+                      "名簿の医院名": m["医院名"], "名簿URL": m["名簿URL"]})
+        else:
+            c.update({"歯科医師会": "非会員", "突合根拠": "会員名簿に該当なし"})
+    for i, m in enumerate(members):
+        if i in used:
+            continue
+        clinics.append({"医院名": m["医院名"], "住所": m["住所"], "電話": m["電話"],
+                        "公式URL": "", "名簿URL": m["名簿URL"], "地区": m["地区"],
+                        "名簿の医院名": m["医院名"], "歯科医師会": "会員",
+                        "突合根拠": "名簿のみ(Google検索で未検出)",
+                        "検索町名": "", "place_id": ""})
+    return clinics
+
+
+def pick_official_url(c: dict) -> None:
+    """Google の URL を優先し、無い/SNS なら名簿のリンクを使う。"""
+    g, m = c.get("公式URL", ""), c.get("名簿URL", "")
+    if g and not is_non_official(g):
+        c["URL出典"] = "Google"
+    elif m and not is_non_official(m):
+        c["公式URL"], c["URL出典"] = m, "歯科医師会名簿"
+    elif g:
+        c["URL出典"] = "Google"
+    elif m:
+        c["公式URL"], c["URL出典"] = m, "歯科医師会名簿"
+    else:
+        c["URL出典"] = ""
+
+
 # ---------------------------------------------------------------- 3. 分類
 
 def classify(c: dict) -> tuple[str, str]:
     url = c.get("公式URL", "")
     if not url:
-        return "HPなし", "Googleに公式URLの登録なし"
+        src = "Google・歯科医師会名簿とも" if c.get("歯科医師会") == "会員" else "Google"
+        return "HPなし", f"公式URLの登録なし({src})"
     if is_non_official(url):
         return "HPなし", f"登録URLがSNS/ポータル({host_of(url)})"
-    if c.get("取得エラー"):
-        return "HPなし", f"URL登録はあるが取得不可({c['取得エラー']})"
+    err = c.get("取得エラー")
+    if err:
+        # 404・DNS 不明はリンク切れ。403/429/5xx/SSL などはサイト自体はあるがこちらから見られない
+        if re.search(r"HTTP (404|410)|ConnectionError|NameResolution", err):
+            return "HPなし", f"URL登録はあるがリンク切れ({err})"
+        return "HPあり(解析不可)", f"サイトはあるが取得を拒否/失敗({err})。ブラウザで要確認"
     if c.get("最終URL") and is_non_official(c["最終URL"]):
         return "HPなし", f"転送先がSNS/ポータル({host_of(c['最終URL'])})"
 
@@ -426,7 +575,8 @@ def classify(c: dict) -> tuple[str, str]:
 
 # ---------------------------------------------------------------- main
 
-COLUMNS = ["区分", "判定根拠", "医院名", "住所", "電話", "公式URL", "最終URL",
+COLUMNS = ["区分", "判定根拠", "歯科医師会", "突合根拠", "地区", "医院名", "名簿の医院名",
+           "住所", "電話", "公式URL", "URL出典", "最終URL",
            "予約システム", "予約リンク", "制作会社", "コピーライト年", "viewport",
            "https", "CMS", "フレーム", "本文文字数", "HTTPステータス", "取得エラー",
            "検索町名", "place_id"]
@@ -448,10 +598,21 @@ def main():
     ap.add_argument("--input-csv", help="Places を使わず、この CSV(医院名,公式URL 列)を解析する")
     ap.add_argument("--towns", help="検索する町名をカンマ区切りで指定(既定: 江東区の全町名)")
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--no-members", action="store_true", help="歯科医師会名簿との突合をしない")
+    ap.add_argument("--members-only", action="store_true",
+                    help="Places を使わず歯科医師会の会員だけを解析する(非会員は識別できない)")
     args = ap.parse_args()
 
+    session = requests.Session()
+    session.headers.update({"User-Agent": UA, "Accept-Language": "ja,en;q=0.8"})
+    adapter = requests.adapters.HTTPAdapter(pool_connections=args.workers, pool_maxsize=args.workers)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
     # 1. 一覧取得
-    if args.input_csv:
+    if args.members_only:
+        clinics = []
+    elif args.input_csv:
         clinics = load_input_csv(args.input_csv)
     elif args.places_cache and os.path.exists(args.places_cache):
         with open(args.places_cache, encoding="utf-8") as f:
@@ -467,14 +628,13 @@ def main():
         if args.places_cache:
             with open(args.places_cache, "w", encoding="utf-8") as f:
                 json.dump(clinics, f, ensure_ascii=False, indent=1)
+    if not args.no_members:
+        clinics = merge_members(clinics, fetch_members(session))
+    for c in clinics:
+        pick_official_url(c)
     print(f"対象: {len(clinics)} 院", file=sys.stderr)
 
     # 2. HP 解析(同じURLは1回だけ取得)
-    session = requests.Session()
-    session.headers.update({"User-Agent": UA, "Accept-Language": "ja,en;q=0.8"})
-    adapter = requests.adapters.HTTPAdapter(pool_connections=args.workers, pool_maxsize=args.workers)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
 
     urls = sorted({c["公式URL"] for c in clinics if c.get("公式URL") and not is_non_official(c["公式URL"])})
     print(f"HP取得: {len(urls)} URL", file=sys.stderr)
@@ -487,8 +647,8 @@ def main():
         c.update(results.get(c.get("公式URL", ""), analyze("", session)))
         c["区分"], c["判定根拠"] = classify(c)
         rows.append(c)
-    order = {"HPなし": 0, "昔風・簡易": 1, "今風": 2, "予約システムあり": 3}
-    rows.sort(key=lambda r: (order[r["区分"]], r.get("住所", "")))
+    order = {"HPなし": 0, "HPあり(解析不可)": 1, "昔風・簡易": 2, "今風": 3, "予約システムあり": 4}
+    rows.sort(key=lambda r: (r.get("歯科医師会", ""), order[r["区分"]], r.get("住所", "")))
 
     with open(args.output, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
@@ -497,6 +657,11 @@ def main():
 
     counts = {k: sum(r["区分"] == k for r in rows) for k in order}
     print(f"出力: {args.output}  " + "  ".join(f"{k}:{v}" for k, v in counts.items()), file=sys.stderr)
+    for g in ("会員", "非会員"):
+        n = [r for r in rows if r.get("歯科医師会") == g]
+        if n:
+            print(f"  {g} {len(n)}院: " + "  ".join(
+                f"{k}:{sum(r['区分'] == k for r in n)}" for k in order), file=sys.stderr)
 
 
 if __name__ == "__main__":
